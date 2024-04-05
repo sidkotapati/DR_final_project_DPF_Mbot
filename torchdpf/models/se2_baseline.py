@@ -2,6 +2,10 @@ import numpy as np
 import torch 
 from torch import nn
 from torchdpf.models.initializations import init_xavier_normal
+from torchdpf.models.components.observation import ObservationalEncoder, ObservationalLikelihoodEstimator
+from torchdpf.models.components.particle import ParticleProposer
+from torchdpf.models.components.action import ActionSampler, MotionTransitionModel
+from torchdpf.utilities.math import wrap_angle
 
 class DPF_SE2(nn.Module): 
     """
@@ -11,181 +15,106 @@ class DPF_SE2(nn.Module):
     def __init__(self):
         super(DPF_SE2, self).__init__()
 
-class ObservationalEncoder(nn.Module): 
-    """
-    Observational encoder for the DPF model. Described on page 3 of the paper, labeled h_theta. 
-    """
-    def __init__(self, H, W, in_channels=3, dropout_rate=0.3): 
-        super(ObservationalEncoder, self).__init__()
-        
-        """
-            Args: 
-                H: Height of the input image
-                W: Width of the input image
-                in_channels: Number of channels in the input image
-                dropout_rate: Dropout rate for the dropout layer in the encoder
-        
-            Observational encoder has the following model structure 
-            conv(3x3, 16, stride 2, relu)
-            conv(3x3, 32, stride 2, relu)
-            conv(3x3, 64, stride 2, relu)
-            dropout(keep 0.3)
-            fc(128, relu)
-        """
-        
-        conv1_num_filters = 16
-        conv2_num_filters = 32
-        conv3_num_filters = 64
-        fc_num_features = 128
-        
-        self.conv1 = nn.Conv2d(in_channels=in_channels, 
-                               out_channels=conv1_num_filters, 
-                               kernel_size=3, 
-                               stride=2, 
-                               padding='same')
-        self.conv2 = nn.Conv2d(in_channels=conv1_num_filters, 
-                               out_channels=conv2_num_filters, 
-                               kernel_size=3, 
-                               stride=2, 
-                               padding='same')
-        self.conv3 = nn.Conv2d(in_channels=conv2_num_filters,
-                               out_channels=conv3_num_filters,
-                               kernel_size=3,
-                               stride=2,
-                               padding='same')
-        self.dropout = nn.Dropout(p=dropout_rate)
-        self.flatten = nn.Flatten(start_dim=1)
-        self.fc = nn.Linear(in_features= conv3_num_filters * (H//8) * (W//8), 
-                            out_features=fc_num_features)
-        self.relu = nn.ReLU()
-        
-        # Initialize weights using Xavier normal initialization
-        self.apply(self.init_xavier_normal)
-        
-    def forward(self, x):
-        
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.relu(self.conv3(x))
-        x = self.dropout(x)
-        x = self.flatten(x)
-        x = self.relu(self.fc(x))
-        
-        return x
-    
-class ObservationalLikelihoodEstimator(nn.Module): 
-    """
-    Observational likelihood estimator for the DPF model. Described on page 3 of the paper, labeled l_theta.
-    """
-    def __init__(self, in_features=128, min_observation_likelihood=0.004): 
-        super(ObservationalLikelihoodEstimator, self).__init__()
-        """
-            Observational likelihood estimator has the following model structure 
-            fc(128, relu)
-            fc(128, relu)
-            fc(1, sigmoid)
-        """
-        
-        fc1_num_features = 128
-        fc2_num_features = 128
-        fc3_num_features = 1
-        
-        self.min_observation_likelihood = min_observation_likelihood
-        self.fc1 = nn.Linear(in_features=in_features, 
-                             out_features=fc1_num_features)
-        self.fc2 = nn.Linear(in_features=fc1_num_features, 
-                             out_features=fc2_num_features)
-        self.fc3 = nn.Linear(in_features=fc2_num_features,
-                                out_features=fc3_num_features)
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
-        
-        # Initialize weights using Xavier normal initialization
-        self.apply(self.init_xavier_normal)
-        
-    def forward(self, x): 
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        x = self.sigmoid(self.fc3(x))
+        self.observation_encoder = ObservationalEncoder(H=24, W=24,
+                                                       in_channels=3,
+                                                       embedding_dim=128,
+                                                       dropout_rate=0.3)
 
-        # Scale the output to be in the range [min_observation_likelihood, 1]
-        # This is to preserve numerical stability
-        x = x * (1 - self.min_observation_likelihood) + self.min_observation_likelihood
-        return x
-    
-    
-class ActionSampler(nn.Module): 
-    """
-    Action sampler for the DPF model. Described on page 3 of the paper, labeled f_theta.
-    """
-    def __init__(self, action_dim=3, state_dim=3, noise_dim=None): 
-        super(ActionSampler, self).__init__()
-        
+        self.observation_likelihood_estimator = ObservationalLikelihoodEstimator(state_dim=3,
+                                                                                embedding_dim=128,
+                                                                                dropout_rate=0.3)
+
+        self.particle_proposer = ParticleProposer(state_dim=3,
+                                                embedding_dim=128,
+                                                dropout_rate=0.3)  
+
+        self.action_sampler = ActionSampler(action_dim=3,
+                                          state_dim=3,
+                                          noise_dim=None)
+
+        self.transition_model = MotionTransitionModel(state_dim=3,
+                                                   embedding_dim=128,
+                                                   dropout_rate=0.3)
+
+        # If false then transition model is disabled
+        self.learn_transition_model = False
+
+
+    def measurement_update(self, encoding, particles, means, stds): 
         """
-            Action sampler has the following model structure 
-            2 x fc(32, relu), fc(3) + mean centering across particles
+        Compute the likelihood of the encoded observation for each particle.
         """
+
+        # First encode particles for input 
+        # Basically, tile encoding for each particle, then concat with normalized particles
+        particle_input = self.encode_particles_for_input(particles, means, stds)
+        encoding_input = encoding.unsqueeze(1).repeat(1, particles.shape[1], 1) 
+        combined_input = torch.cat([particle_input, encoding_input], dim=-1)
         
-        self.action_dim = action_dim 
-        self.state_dim = state_dim 
+        # Estimate the likelihood and remove the last dimension 
+        obs_likelihood = self.observation_likelihood_estimator(combined_input).squeeze(-1)
+
+        return obs_likelihood
         
-        if noise_dim is None: 
-            self.noise_dim = action_dim
+    def encode_particles_for_input(self, particles, means, stds): 
+        """
+        Normalizes particles and appends sine/cosine of the angle to the particles. 
+        """
+        normalized_xy = (particles[:, :, :-1] - means[:, :, -1]) / stds[:, :, -1]
+        sine_angles = torch.sin(particles[:, :, -1])
+        cosine_angles = torch.cos(particles[:, :, -1])
+        return torch.cat([normalized_xy, sine_angles, cosine_angles], dim=-1)
+
+    def motion_update(self, actions, particles, means, stds, stop_sampling_gradient=False):
+        """
+        Perform a noisy motion update on the particles. 
+        """
+
+        # Get noisy actions
+        noisy_actions = self.action_sampler(actions, stds, particles)
+
+        # Apply noisy actions, depending on whether or not the learned odom model is used
+        if self.learn_transition_model: 
+            # Encode particles for input 
+            # BUG: Two different means, one for actions, one for pose 
+            state_input = self.encode_particles_for_input(particles, means, stds)
+            action_input = actions / stds
+            input = torch.cat([state_input, action_input], dim=-1)
+            # Estimate the state delta, scale, and apply 
+            delta = self.transition_model(input)
+            new_states = particles + delta
+            new_states[:, :, 2] = wrap_angle(new_states[:, :, 2]) 
         else: 
-            self.noise_dim = noise_dim
-        
-        fc1_num_features = 32
-        fc2_num_features = 32
-        fc3_num_features = action_dim
-        
-        self.fc1 = nn.Linear(in_features=self.action_dim + self.noise_dim, 
-                             out_features=fc1_num_features)
-        
-        self.fc2 = nn.Linear(in_features=fc1_num_features,
-                            out_features=fc2_num_features)
-        
-        self.fc3 = nn.Linear(in_features=fc2_num_features,
-                            out_features=self.state_dim)
-        
-        self.relu = nn.ReLU()
-        
-        # Initialize weights using Xavier normal initialization
-        self.apply(self.init_xavier_normal)
-        
-    def generate_motion_noise(self, x): 
+            theta = particles[:, :, 2]
+            sin_theta = torch.sin(theta)
+            cos_theta = torch.cos(theta)
+            # Move the particles using the noisy actions 
+            new_x = particles[:, :, 0] + noisy_actions[:, :, 0] * cos_theta - noisy_actions[:, :, 1] * sin_theta
+            new_y = particles[:, :, 1] + noisy_actions[:, :, 0] * sin_theta + noisy_actions[:, :, 1] * cos_theta
+            new_theta = wrap_angle(particles[:, :, 2] + noisy_actions[:, :, 2])
+
+            new_states = torch.stack([new_x, new_y, new_theta], dim=-1)
+
+        return new_states
+    
+
+    def propose_particles(self, encoding, num_particles, state_mins, state_maxs): 
         """
-        Generate motion noise for the action sampler. 
+            Generates num_particles new proposed partciles based on the current observation embedding. 
+            Particle proposals are multiplied by the halved difference between state_maxs and state_mins
         """
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        x = self.relu(x)
-        x = self.fc3(x)
         
-    def forward(self, actions, stds, particles): 
-        # Normalize actions 
-        actions_normalized = actions / stds[:, None]
+        tiled_encoding = torch.tile(encoding, (1, num_particles, 1))
+        proposed_particles = self.particle_proposer(tiled_encoding)
         
-        # Add dimension for particles and repeat actions 
-        actions_expanded = (actions_normalized.unsqueeze(1)
-                            .expand(-1, particles.shape[1], -1))
-        
-        # Generate random input 
-        random_input = torch.randn_like(actions_expanded)
-        
-        # Concatenate actions and random input
-        x = torch.cat([actions_expanded, random_input], dim=-1)
-        
-        # Generate action noise
-        delta = self.generate_motion_noise(x)
-        
-        # Detach gradient from delta 
-        delta = delta.detach()
-        
-        # Zero-mean the action noise
-        delta -= delta.mean(dim=1, keepdim=True)
-        
-        # Add noise to actions 
-        noisy_actions = actions.unsqueeze(1) + delta
-        
-        return noisy_actions
+        halved_ranges = state_maxs - state_mins / 2
+        avereaged_ranges = (state_maxs + state_mins) / 2
+
+        proposed_particles = torch.cat([proposed_particles[:, :, :2] * halved_ranges[:, :, :2] + avereaged_ranges[:, :, :2],
+                                        torch.atan2(proposed_particles[:, :, 3], proposed_particles[:, :, 4], dim=-1)])
+
+        return proposed_particles
+
+
+    def forward(self, observation, action, particles, particle_weights):
+        return
